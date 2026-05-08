@@ -1,0 +1,3 @@
+Cleanup log.
+
+Deletions will be appended here after interactive confirmation.
