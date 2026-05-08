@@ -2,12 +2,130 @@
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
+import subprocess
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
-from cleaner import Cleaner
-from report import write_report
-from scanner import DEFAULT_LARGE_FILE_BYTES, DEFAULT_MIN_TARGET_BYTES, StorageScanner
-from utils import RISK_SAFE, CleanupTarget, bytes_to_human, display_path
+
+RISK_SAFE = "SAFE"
+RISK_REVIEW = "REVIEW"
+RISK_DANGEROUS = "DANGEROUS"
+
+HOME = Path.home()
+DEFAULT_MIN_TARGET_BYTES = 100 * 1024 * 1024
+DEFAULT_LARGE_FILE_BYTES = 1024**3
+DEFAULT_MAX_DEPTH = 8
+
+PROTECTED_EXACT_PATHS = {
+    HOME,
+    HOME / "Documents",
+    HOME / "Desktop",
+    HOME / "Pictures",
+    HOME / "Movies",
+    HOME / "Music",
+    HOME / "Applications",
+    Path("/"),
+    Path("/System"),
+    Path("/Library"),
+    Path("/usr"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/Applications"),
+}
+
+PROTECTED_SCAN_ROOTS = {
+    HOME / "Documents",
+    HOME / "Desktop",
+    HOME / "Pictures",
+    HOME / "Movies",
+    HOME / "Music",
+    HOME / "Applications",
+    Path("/System"),
+    Path("/Library"),
+    Path("/usr"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/Applications"),
+}
+
+ORGANIZER_ACTIONS = {
+    "installer": "Review installers. Most old .dmg and .pkg files can be deleted after installation.",
+    "archive": "Review archives. Keep only source archives that cannot be downloaded again.",
+    "video": "Move wanted videos to a media folder or external storage; delete throwaway captures.",
+    "large-file": "Review manually. Large files are not safe to classify automatically.",
+}
+
+
+@dataclass(frozen=True)
+class CleanupTarget:
+    name: str
+    path: Path
+    size_bytes: int
+    risk: str
+    recommended: bool
+    category: str
+    reason: str
+    paths: tuple[Path, ...] = field(default_factory=tuple)
+    deletable: bool = True
+    details: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.paths:
+            object.__setattr__(self, "paths", (self.path,))
+
+    @property
+    def size_gb(self) -> float:
+        return self.size_bytes / (1024**3)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "path": display_path(self.path),
+            "size_gb": round(self.size_gb, 2),
+            "risk": self.risk,
+            "recommended": self.recommended,
+            "category": self.category,
+            "reason": self.reason,
+            "deletable": self.deletable,
+        }
+
+
+@dataclass(frozen=True)
+class LargeFile:
+    path: Path
+    size_bytes: int
+    modified_at: datetime
+    category: str
+
+
+@dataclass(frozen=True)
+class OrganizerBucket:
+    name: str
+    action: str
+    size_bytes: int
+    files: tuple[LargeFile, ...]
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    targets: list[CleanupTarget]
+    large_files: list[LargeFile]
+    large_directories: list[CleanupTarget]
+    organizer_buckets: list[OrganizerBucket]
+    warnings: list[str]
+
+
+@dataclass(frozen=True)
+class DeletionResult:
+    target: CleanupTarget
+    recovered_bytes: int
+    deleted_paths: tuple[Path, ...]
+    skipped_paths: tuple[str, ...]
 
 
 def main() -> int:
@@ -25,6 +143,7 @@ def main() -> int:
     write_report(result, args.report)
     print(f"\nCleanup report written to {display_path(args.report)}")
     print_targets(targets)
+    print_organizer_summary(result.organizer_buckets, args.report)
 
     if args.dry_run:
         print("\nDry run enabled. No deletion prompt was shown.")
@@ -36,7 +155,7 @@ def main() -> int:
         return 0
 
     show_selection(selected)
-    if input("\nType DELETE to confirm: ").strip() != "DELETE":
+    if input("\nType DELETE to confirm deletion of the selected targets: ").strip() != "DELETE":
         print("Cancelled. Nothing was deleted.")
         return 0
 
@@ -69,7 +188,7 @@ def parse_args() -> argparse.Namespace:
         "--scan-root",
         action="append",
         type=Path,
-        help="Additional or replacement developer root to scan. Can be passed multiple times.",
+        help="Developer root to scan for node_modules, virtualenvs, __pycache__, and large files. Can be passed multiple times.",
     )
     parser.add_argument(
         "--report",
@@ -98,10 +217,595 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=8,
+        default=DEFAULT_MAX_DEPTH,
         help="Maximum recursive scan depth for developer roots.",
     )
     return parser.parse_args()
+
+
+class StorageScanner:
+    def __init__(
+        self,
+        scan_roots: list[Path] | None = None,
+        min_target_bytes: int = DEFAULT_MIN_TARGET_BYTES,
+        large_file_bytes: int = DEFAULT_LARGE_FILE_BYTES,
+        max_depth: int = DEFAULT_MAX_DEPTH,
+    ) -> None:
+        self.scan_roots = [safe_resolve(path) for path in scan_roots] if scan_roots else self._default_dev_roots()
+        self.min_target_bytes = min_target_bytes
+        self.large_file_bytes = large_file_bytes
+        self.max_depth = max_depth
+        self.warnings: list[str] = []
+
+    def scan(self) -> ScanResult:
+        targets: list[CleanupTarget] = []
+        targets.extend(self._scan_known_cache_paths())
+        targets.extend(self._scan_conda_envs())
+        targets.extend(self._scan_library_cache_children())
+        targets.extend(self._scan_dev_junk())
+        targets.extend(self._scan_docker())
+
+        large_files = self._scan_large_files()
+        targets.extend(self._targets_for_download_files(large_files))
+
+        targets = self._dedupe_targets(targets)
+        targets.sort(key=lambda item: item.size_bytes, reverse=True)
+        large_dirs = [target for target in targets if target.size_bytes >= self.min_target_bytes and target.path.is_dir()]
+        organizer_buckets = build_organizer_buckets(large_files)
+
+        return ScanResult(
+            targets=targets,
+            large_files=large_files,
+            large_directories=large_dirs,
+            organizer_buckets=organizer_buckets,
+            warnings=self.warnings,
+        )
+
+    def _default_dev_roots(self) -> list[Path]:
+        candidates = [
+            HOME / "Projects",
+            HOME / "Developer",
+            HOME / "Code",
+            HOME / "src",
+            HOME / "workspace",
+            HOME / "Desktop" / "Projects",
+        ]
+        return [path for path in candidates if path.exists()]
+
+    def _add_target(
+        self,
+        targets: list[CleanupTarget],
+        *,
+        name: str,
+        path: Path,
+        risk: str,
+        recommended: bool,
+        category: str,
+        reason: str,
+        size_bytes: int | None = None,
+        paths: tuple[Path, ...] | None = None,
+        deletable: bool = True,
+        details: dict[str, str] | None = None,
+    ) -> None:
+        expanded = safe_resolve(path)
+        if not expanded.exists() and not str(path).startswith("<"):
+            return
+        if expanded.exists() and is_protected_exact_path(expanded):
+            return
+        if expanded.exists() and is_source_repo_root(expanded):
+            return
+
+        if size_bytes is None:
+            try:
+                size_bytes = directory_size(expanded) if expanded.is_dir() else expanded.stat().st_size
+            except OSError:
+                return
+        if size_bytes <= 0:
+            return
+        if size_bytes < self.min_target_bytes and category not in {"developer-junk-small", "docker"}:
+            return
+
+        targets.append(
+            CleanupTarget(
+                name=name,
+                path=expanded,
+                size_bytes=size_bytes,
+                risk=risk,
+                recommended=recommended,
+                category=category,
+                reason=reason,
+                paths=paths or (expanded,),
+                deletable=deletable,
+                details=details or {},
+            )
+        )
+
+    def _scan_known_cache_paths(self) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        known_paths = [
+            ("HuggingFace cache", HOME / ".cache" / "huggingface", RISK_REVIEW, True, "cache", "Downloaded models and datasets can usually be restored later."),
+            ("Torch cache", HOME / ".cache" / "torch", RISK_SAFE, True, "cache", "Torch downloads rebuild on demand."),
+            ("pip cache", HOME / "Library" / "Caches" / "pip", RISK_SAFE, True, "cache", "pip package downloads rebuild on demand."),
+            ("pip cache", HOME / ".cache" / "pip", RISK_SAFE, True, "cache", "pip package downloads rebuild on demand."),
+            ("Homebrew cache", HOME / "Library" / "Caches" / "Homebrew", RISK_SAFE, True, "cache", "Homebrew cache can be re-downloaded if needed."),
+            ("Xcode DerivedData", HOME / "Library" / "Developer" / "Xcode" / "DerivedData", RISK_SAFE, True, "cache", "Xcode build artifacts rebuild on demand."),
+            ("User logs", HOME / "Library" / "Logs", RISK_SAFE, False, "logs", "Logs are usually removable, but keeping recent logs can help debugging."),
+        ]
+
+        for name, path, risk, recommended, category, reason in known_paths:
+            self._add_target(
+                targets,
+                name=name,
+                path=path,
+                risk=risk,
+                recommended=recommended,
+                category=category,
+                reason=reason,
+            )
+        return targets
+
+    def _scan_conda_envs(self) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        env_roots = [HOME / "miniconda3" / "envs", HOME / "anaconda3" / "envs", HOME / ".conda" / "envs"]
+
+        for env_root in iter_existing(env_roots):
+            try:
+                envs = [child for child in env_root.iterdir() if child.is_dir() and not child.is_symlink()]
+            except (OSError, PermissionError):
+                continue
+            for env in envs:
+                self._add_target(
+                    targets,
+                    name=f"Conda env: {env.name}",
+                    path=env,
+                    risk=RISK_REVIEW,
+                    recommended=False,
+                    category="environment",
+                    reason="Conda environments may be active project dependencies; review before deleting.",
+                )
+        return targets
+
+    def _scan_library_cache_children(self) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        cache_root = HOME / "Library" / "Caches"
+        if not cache_root.exists():
+            return targets
+
+        known_names = {"pip", "homebrew"}
+        try:
+            children = [child for child in cache_root.iterdir() if child.is_dir() and not child.is_symlink()]
+        except (OSError, PermissionError):
+            return targets
+
+        for child in children:
+            if child.name.lower() in known_names:
+                continue
+            self._add_target(
+                targets,
+                name=f"App cache: {child.name}",
+                path=child,
+                risk=RISK_REVIEW,
+                recommended=False,
+                category="cache",
+                reason="App caches are often rebuildable, but deleting them can slow the next launch.",
+            )
+        return targets
+
+    def _scan_dev_junk(self) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        pycache_paths: list[Path] = []
+        pycache_size = 0
+
+        for root in self.scan_roots:
+            if not root.exists():
+                continue
+            for path in self._walk_dirs(root):
+                name = path.name
+                if name == "node_modules":
+                    self._add_target(
+                        targets,
+                        name=f"node_modules: {path.parent.name}",
+                        path=path,
+                        risk=RISK_REVIEW,
+                        recommended=True,
+                        category="developer-junk",
+                        reason="Node dependencies are large and can be restored with npm, pnpm, or yarn.",
+                    )
+                    continue
+                if name in {".venv", "venv"}:
+                    self._add_target(
+                        targets,
+                        name=f"Python venv: {path.parent.name}/{name}",
+                        path=path,
+                        risk=RISK_REVIEW,
+                        recommended=False,
+                        category="environment",
+                        reason="Virtual environments may be project-specific; review before deleting.",
+                    )
+                    continue
+                if name == "__pycache__":
+                    size = directory_size(path)
+                    if size > 0:
+                        pycache_paths.append(path)
+                        pycache_size += size
+
+        if pycache_paths:
+            targets.append(
+                CleanupTarget(
+                    name="Python __pycache__ folders",
+                    path=pycache_paths[0],
+                    size_bytes=pycache_size,
+                    risk=RISK_SAFE,
+                    recommended=True,
+                    category="developer-junk-small",
+                    reason="Python bytecode caches are regenerated automatically.",
+                    paths=tuple(pycache_paths),
+                    deletable=True,
+                    details={"count": str(len(pycache_paths))},
+                )
+            )
+        return targets
+
+    def _walk_dirs(self, root: Path):
+        stack: list[tuple[Path, int]] = [(safe_resolve(root), 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > self.max_depth:
+                continue
+            if current.is_symlink() or should_prune_scan_dir(current):
+                continue
+            yield current
+
+            if current.name in {"node_modules", ".venv", "venv", "__pycache__"}:
+                continue
+
+            try:
+                children = [child for child in current.iterdir() if child.is_dir()]
+            except (OSError, PermissionError):
+                continue
+            for child in children:
+                stack.append((child, depth + 1))
+
+    def _scan_large_files(self) -> list[LargeFile]:
+        files: list[LargeFile] = []
+        roots = [HOME / "Downloads", *self.scan_roots]
+
+        for root in roots:
+            if not root.exists() or should_prune_scan_dir(root):
+                continue
+            for file_path in self._walk_files(root):
+                try:
+                    size = file_path.stat().st_size
+                except (OSError, PermissionError):
+                    continue
+                suffix = file_path.suffix.lower()
+                is_large = size >= self.large_file_bytes
+                is_review_archive = root == HOME / "Downloads" and suffix in {".dmg", ".zip", ".pkg"} and size >= self.min_target_bytes
+                if is_large or is_review_archive:
+                    files.append(
+                        LargeFile(
+                            path=file_path,
+                            size_bytes=size,
+                            modified_at=file_modified_at(file_path),
+                            category=self._file_category(file_path),
+                        )
+                    )
+
+        files.sort(key=lambda item: item.size_bytes, reverse=True)
+        return files
+
+    def _walk_files(self, root: Path):
+        stack: list[tuple[Path, int]] = [(safe_resolve(root), 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > self.max_depth:
+                continue
+            if current.is_symlink():
+                continue
+            if current.is_file():
+                yield current
+                continue
+            if should_prune_scan_dir(current):
+                continue
+            if current.name in {"node_modules", ".venv", "venv", "__pycache__"}:
+                continue
+            try:
+                for child in current.iterdir():
+                    stack.append((child, depth + 1))
+            except (OSError, PermissionError):
+                continue
+
+    def _file_category(self, path: Path) -> str:
+        suffix = path.suffix.lower()
+        if suffix in {".dmg", ".pkg"}:
+            return "installer"
+        if suffix in {".zip", ".tar", ".gz", ".tgz", ".rar", ".7z"}:
+            return "archive"
+        if suffix in {".mp4", ".mov", ".mkv", ".avi"}:
+            return "video"
+        return "large-file"
+
+    def _targets_for_download_files(self, large_files: list[LargeFile]) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        for item in large_files:
+            if item.path.parent != HOME / "Downloads":
+                continue
+            self._add_target(
+                targets,
+                name=f"{item.category.title()} file: {item.path.name}",
+                path=item.path,
+                size_bytes=item.size_bytes,
+                risk=RISK_REVIEW,
+                recommended=False,
+                category=item.category,
+                reason="Large Downloads files should be reviewed before deletion.",
+            )
+        return targets
+
+    def _scan_docker(self) -> list[CleanupTarget]:
+        if not shutil.which("docker"):
+            return []
+
+        try:
+            result = subprocess.run(
+                ["docker", "system", "df"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+
+        reclaimable = self._parse_docker_reclaimable(result.stdout)
+        if reclaimable <= 0:
+            return []
+
+        return [
+            CleanupTarget(
+                name="Docker reclaimable data",
+                path=Path("<docker system df>"),
+                size_bytes=reclaimable,
+                risk=RISK_REVIEW,
+                recommended=False,
+                category="docker",
+                reason="Docker prune operations can remove images, containers, volumes, and build cache; review manually.",
+                deletable=False,
+                details={"preview": result.stdout.strip()},
+            )
+        ]
+
+    def _parse_docker_reclaimable(self, output: str) -> int:
+        total = 0
+        for line in output.splitlines()[1:]:
+            parts = re.split(r"\s{2,}", line.strip())
+            if len(parts) < 5:
+                continue
+            reclaimable = parts[4].split(" ", 1)[0]
+            total += parse_human_size(reclaimable)
+        return total
+
+    def _dedupe_targets(self, targets: list[CleanupTarget]) -> list[CleanupTarget]:
+        deduped: list[CleanupTarget] = []
+        seen: set[str] = set()
+        for target in targets:
+            key = "|".join(sorted(display_path(path) for path in target.paths)) or target.name
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(target)
+        return deduped
+
+
+class Cleaner:
+    def __init__(self, log_path: Path) -> None:
+        self.log_path = log_path.expanduser()
+
+    def delete_targets(self, targets: list[CleanupTarget]) -> list[DeletionResult]:
+        results: list[DeletionResult] = []
+        for target in targets:
+            result = self._delete_target(target)
+            results.append(result)
+            if result.deleted_paths:
+                self._log_result(result)
+        return results
+
+    def _delete_target(self, target: CleanupTarget) -> DeletionResult:
+        skipped: list[str] = []
+        deleted: list[Path] = []
+        recovered = 0
+
+        if not target.deletable:
+            return DeletionResult(target, 0, tuple(), (f"{target.name} is report-only and must be cleaned manually.",))
+        if target.risk == RISK_DANGEROUS:
+            return DeletionResult(target, 0, tuple(), (f"{target.name} is marked DANGEROUS.",))
+
+        for path in target.paths:
+            allowed, reason = self._is_safe_delete_path(path)
+            if not allowed:
+                skipped.append(f"{display_path(path)}: {reason}")
+                continue
+            if not path.exists():
+                skipped.append(f"{display_path(path)}: path no longer exists")
+                continue
+
+            size_before = path_size(path)
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError as exc:
+                skipped.append(f"{display_path(path)}: {exc}")
+                continue
+
+            recovered += size_before
+            deleted.append(path)
+
+        return DeletionResult(target, recovered, tuple(deleted), tuple(skipped))
+
+    def _is_safe_delete_path(self, path: Path) -> tuple[bool, str]:
+        if is_protected_exact_path(path):
+            return False, "protected user or system root"
+        if is_system_protected_path(path):
+            return False, "system path"
+        if path.is_symlink():
+            return False, "symlink"
+        if path.name in {".git", ".svn", ".hg"}:
+            return False, "source control metadata"
+        if path.is_dir() and is_source_repo_root(path):
+            return False, "git repository root"
+        return True, ""
+
+    def _log_result(self, result: DeletionResult) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]",
+            f"Deleted {result.target.name}",
+            f"Recovered {bytes_to_human(result.recovered_bytes)}",
+        ]
+        lines.extend(f"- {display_path(path)}" for path in result.deleted_paths)
+        lines.append("")
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+
+
+def build_organizer_buckets(files: list[LargeFile]) -> list[OrganizerBucket]:
+    grouped: dict[str, list[LargeFile]] = defaultdict(list)
+    for file in files:
+        grouped[file.category].append(file)
+
+    buckets: list[OrganizerBucket] = []
+    for category, items in grouped.items():
+        items.sort(key=lambda item: item.size_bytes, reverse=True)
+        buckets.append(
+            OrganizerBucket(
+                name=category.replace("-", " ").title(),
+                action=ORGANIZER_ACTIONS.get(category, ORGANIZER_ACTIONS["large-file"]),
+                size_bytes=sum(item.size_bytes for item in items),
+                files=tuple(items),
+            )
+        )
+
+    buckets.sort(key=lambda bucket: bucket.size_bytes, reverse=True)
+    return buckets
+
+
+def write_report(result: ScanResult, output_path: Path) -> None:
+    output_path = output_path.expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(build_report(result), encoding="utf-8")
+
+
+def build_report(result: ScanResult) -> str:
+    total = sum(target.size_bytes for target in result.targets if target.risk != RISK_DANGEROUS)
+    safe = [target for target in result.targets if target.risk == RISK_SAFE and target.recommended]
+    review = [target for target in result.targets if target.risk == RISK_REVIEW]
+
+    lines: list[str] = [
+        "# Cleanup Report",
+        "",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "## Total Potential Recoverable Space",
+        "",
+        bytes_to_human(total),
+        "",
+        "---",
+        "",
+        "## Ranked Cleanup Suggestions",
+        "",
+        "| Rank | Category | Size | Risk | Path | Reason |",
+        "|---|---|---:|---|---|---|",
+    ]
+
+    for index, target in enumerate(result.targets, start=1):
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    str(index),
+                    markdown_escape(target.name),
+                    bytes_to_human(target.size_bytes),
+                    target.risk,
+                    markdown_escape(target_path_label(target)),
+                    markdown_escape(target.reason),
+                ]
+            )
+            + " |"
+        )
+
+    lines.extend(["", "---", "", "## Large Files Over 1 GB", "", "| File | Size | Last Modified |", "|---|---:|---|"])
+    for file in result.large_files:
+        if file.size_bytes < 1024**3:
+            continue
+        lines.append(
+            f"| {markdown_escape(display_path(file.path))} | {bytes_to_human(file.size_bytes)} | {file.modified_at.strftime('%Y-%m-%d %H:%M')} |"
+        )
+
+    lines.extend(["", "---", "", "## Large Directories", "", "| Folder | Size |", "|---|---:|"])
+    for target in result.large_directories:
+        lines.append(f"| {markdown_escape(target_path_label(target))} | {bytes_to_human(target.size_bytes)} |")
+
+    lines.extend(["", "---", "", "## Recommended Safe Deletions", ""])
+    if safe:
+        lines.extend(f"- {target.name}: `{display_path(target.path)}` ({bytes_to_human(target.size_bytes)})" for target in safe)
+    else:
+        lines.append("- None found above the configured threshold.")
+
+    lines.extend(["", "---", "", "## Recommended Review Targets", ""])
+    if review:
+        lines.extend(f"- {target.name}: `{target_path_label(target)}` ({bytes_to_human(target.size_bytes)})" for target in review)
+    else:
+        lines.append("- None found above the configured threshold.")
+
+    lines.extend(organizer_report_section(result))
+
+    if result.warnings:
+        lines.extend(["", "---", "", "## Scan Warnings", ""])
+        lines.extend(f"- {warning}" for warning in result.warnings)
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def organizer_report_section(result: ScanResult) -> list[str]:
+    lines = [
+        "",
+        "---",
+        "",
+        "## Recommended Organizer",
+        "",
+        "These are review-only organization buckets. The tool does not move files automatically.",
+        "",
+        "| Bucket | Size | Files | Recommendation |",
+        "|---|---:|---:|---|",
+    ]
+
+    if not result.organizer_buckets:
+        lines.append("| None | 0 B | 0 | No large files matched the organizer rules. |")
+        return lines
+
+    for bucket in result.organizer_buckets:
+        lines.append(
+            f"| {markdown_escape(bucket.name)} | {bytes_to_human(bucket.size_bytes)} | {len(bucket.files)} | {markdown_escape(bucket.action)} |"
+        )
+
+    lines.extend(["", "### Top Organizer Files", "", "| File | Bucket | Size | Last Modified |", "|---|---|---:|---|"])
+    top_files = sorted(
+        [file for bucket in result.organizer_buckets for file in bucket.files],
+        key=lambda item: item.size_bytes,
+        reverse=True,
+    )[:25]
+    for file in top_files:
+        lines.append(
+            f"| {markdown_escape(display_path(file.path))} | {markdown_escape(file.category)} | {bytes_to_human(file.size_bytes)} | {file.modified_at.strftime('%Y-%m-%d %H:%M')} |"
+        )
+
+    return lines
 
 
 def print_targets(targets: list[CleanupTarget]) -> None:
@@ -122,6 +826,17 @@ def print_targets(targets: list[CleanupTarget]) -> None:
     print("\n* recommended by the scanner")
 
 
+def print_organizer_summary(buckets: list[OrganizerBucket], report_path: Path) -> None:
+    print("\nOrganizer suggestions:")
+    if not buckets:
+        print("No large organizer buckets found.")
+        return
+
+    for bucket in buckets[:8]:
+        print(f"- {bucket.name:<14} {bytes_to_human(bucket.size_bytes):>10}  {len(bucket.files)} files")
+    print(f"Full organizer details are in {display_path(report_path)}.")
+
+
 def prompt_for_selection(targets: list[CleanupTarget]) -> list[CleanupTarget]:
     if not targets:
         return []
@@ -139,11 +854,15 @@ def prompt_for_selection(targets: list[CleanupTarget]) -> list[CleanupTarget]:
         return [target for target in targets if target.risk == RISK_SAFE and target.recommended and target.deletable]
 
     selected: list[CleanupTarget] = []
+    seen_indexes: set[int] = set()
     for part in raw.replace(",", " ").split():
         if not part.isdigit():
             print(f"Ignoring invalid selection: {part}")
             continue
         index = int(part)
+        if index in seen_indexes:
+            continue
+        seen_indexes.add(index)
         if index < 1 or index > len(targets):
             print(f"Ignoring out-of-range selection: {index}")
             continue
@@ -168,6 +887,160 @@ def show_selection(selected: list[CleanupTarget]) -> None:
             print(f"    ... and {len(paths) - 20} more paths")
 
     print(f"\nEstimated recovery: {bytes_to_human(total)}")
+
+
+def expand_path(path: str | Path) -> Path:
+    return Path(path).expanduser()
+
+
+def safe_resolve(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve(strict=False)
+    except OSError:
+        return path.expanduser().absolute()
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    path = safe_resolve(path)
+    parent = safe_resolve(parent)
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def display_path(path: str | Path) -> str:
+    raw = str(expand_path(path))
+    home = str(HOME)
+    if raw == home:
+        return "~"
+    if raw.startswith(home + "/"):
+        return "~/" + raw[len(home) + 1 :]
+    return raw
+
+
+def bytes_to_human(size: int) -> str:
+    value = float(max(size, 0))
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def parse_human_size(value: str) -> int:
+    text = value.strip().upper().replace("IB", "B")
+    if not text:
+        return 0
+
+    number = ""
+    unit = ""
+    for char in text:
+        if char.isdigit() or char == ".":
+            number += char
+        elif char.isalpha():
+            unit += char
+
+    if not number:
+        return 0
+
+    multipliers = {
+        "B": 1,
+        "K": 1024,
+        "KB": 1024,
+        "M": 1024**2,
+        "MB": 1024**2,
+        "G": 1024**3,
+        "GB": 1024**3,
+        "T": 1024**4,
+        "TB": 1024**4,
+    }
+    return int(float(number) * multipliers.get(unit or "B", 1))
+
+
+def is_protected_exact_path(path: Path) -> bool:
+    resolved = safe_resolve(path)
+    return any(resolved == safe_resolve(protected) for protected in PROTECTED_EXACT_PATHS)
+
+
+def is_system_protected_path(path: Path) -> bool:
+    resolved = safe_resolve(path)
+    system_roots = (Path("/System"), Path("/Library"), Path("/usr"), Path("/bin"), Path("/sbin"), Path("/Applications"))
+    return any(resolved == root or is_relative_to(resolved, root) for root in system_roots)
+
+
+def should_prune_scan_dir(path: Path) -> bool:
+    resolved = safe_resolve(path)
+    if resolved.name in {".git", ".svn", ".hg"}:
+        return True
+    return any(resolved == safe_resolve(root) for root in PROTECTED_SCAN_ROOTS)
+
+
+def is_source_repo_root(path: Path) -> bool:
+    return (path / ".git").exists()
+
+
+def directory_size(path: Path) -> int:
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            if current.is_symlink():
+                continue
+            if current.is_file():
+                total += current.stat().st_size
+                continue
+            for child in current.iterdir():
+                try:
+                    if child.is_symlink():
+                        continue
+                    if child.is_dir():
+                        stack.append(child)
+                    elif child.is_file():
+                        total += child.stat().st_size
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            continue
+    return total
+
+
+def path_size(path: Path) -> int:
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    return directory_size(path)
+
+
+def file_modified_at(path: Path) -> datetime:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return datetime.fromtimestamp(0)
+
+
+def iter_existing(paths: Iterable[Path]) -> Iterable[Path]:
+    for path in paths:
+        expanded = path.expanduser()
+        if expanded.exists():
+            yield expanded
+
+
+def target_path_label(target: CleanupTarget) -> str:
+    if len(target.paths) == 1:
+        return display_path(target.path)
+    return f"{len(target.paths)} paths, starting at {display_path(target.path)}"
+
+
+def markdown_escape(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
 
 
 if __name__ == "__main__":

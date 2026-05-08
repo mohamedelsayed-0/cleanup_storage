@@ -2,7 +2,19 @@
 
 A local, dependency-free Mac storage cleanup assistant focused on developer-heavy junk: package caches, ML model caches, virtual environments, `node_modules`, Xcode build artifacts, and large Downloads files.
 
-The tool scans, ranks cleanup candidates by size, writes a Markdown report, and asks for explicit confirmation before deleting anything.
+Everything runs from one terminal script:
+
+```bash
+python3 cleanup.py
+```
+
+The script scans, ranks cleanup candidates by size, writes a Markdown report, asks terminal questions for target selection, and requires typing exactly `DELETE` before removing anything.
+
+## Files
+
+- `cleanup.py`: the full scanner, reporter, organizer, approval prompt, deletion logic, and logger.
+- `cleanup_report.md`: generated Markdown report.
+- `cleanup_log.txt`: appended deletion log.
 
 ## Safety Model
 
@@ -33,13 +45,13 @@ Run a scan and generate `cleanup_report.md` without deleting anything:
 python3 cleanup.py --dry-run
 ```
 
-Run the interactive cleanup flow:
+Run the interactive terminal cleanup flow:
 
 ```bash
 python3 cleanup.py
 ```
 
-The interactive flow shows ranked targets and accepts selections like:
+The prompt accepts selections like:
 
 ```text
 1 2 5
@@ -101,9 +113,4 @@ Low-priority targets:
 
 ## Organizer
 
-The report includes a recommended organizer section for large files. It groups review items into buckets such as installers, archives, videos, and large files. This is advisory only; the tool does not move or rename files automatically.
-
-## Generated Files
-
-- `cleanup_report.md`: ranked cleanup suggestions, large files, large directories, and organizer recommendations.
-- `cleanup_log.txt`: appended deletion log with timestamp, paths, and recovered space.
+The terminal output and report include a recommended organizer summary for large files. It groups review items into buckets such as installers, archives, videos, and large files. This is advisory only; the tool does not move or rename files automatically.
