@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ HOME = Path.home()
 DEFAULT_MIN_TARGET_BYTES = 100 * 1024 * 1024
 DEFAULT_LARGE_FILE_BYTES = 1024**3
 DEFAULT_MAX_DEPTH = 8
+DEFAULT_DUPLICATE_MIN_BYTES = 50 * 1024 * 1024
 
 PROTECTED_EXACT_PATHS = {
     HOME,
@@ -72,6 +74,7 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".heic", ".webp"}
 DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".md"}
 CODE_ARCHIVE_EXTENSIONS = {".xcodeproj", ".xcworkspace"}
 MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx"}
+DUPLICATE_SCAN_EXTENSIONS = SCREENSHOT_EXTENSIONS | VIDEO_EXTENSIONS | INSTALLER_EXTENSIONS | ARCHIVE_EXTENSIONS | PDF_EXTENSIONS | IMAGE_EXTENSIONS | MODEL_EXTENSIONS
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,16 @@ class OrganizerBucket:
 
 
 @dataclass(frozen=True)
+class DuplicateGroup:
+    digest: str
+    file_size: int
+    reclaimable_bytes: int
+    keep_path: Path
+    duplicate_paths: tuple[Path, ...]
+    category: str
+
+
+@dataclass(frozen=True)
 class StorageBucket:
     name: str
     size_bytes: int
@@ -141,6 +154,7 @@ class ScanResult:
     organizer_buckets: list[OrganizerBucket]
     downloads_breakdown: list[StorageBucket]
     storage_heatmap: list[StorageBucket]
+    duplicate_groups: list[DuplicateGroup]
     warnings: list[str]
 
 
@@ -160,6 +174,8 @@ def main() -> int:
         min_target_bytes=args.min_target_mb * 1024 * 1024,
         large_file_bytes=int(args.large_file_gb * 1024**3),
         max_depth=args.max_depth,
+        duplicate_scan=not args.no_duplicates,
+        duplicate_min_bytes=args.duplicate_min_mb * 1024 * 1024,
     )
     result = scanner.scan()
     targets = result.targets
@@ -168,6 +184,7 @@ def main() -> int:
     print(f"\nCleanup report written to {display_path(args.report)}")
     print_targets(targets)
     print_storage_heatmap(result.storage_heatmap)
+    print_duplicate_summary(result.duplicate_groups, args.report)
     print_organizer_summary(result.organizer_buckets, args.report)
 
     if args.dry_run:
@@ -245,6 +262,17 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_DEPTH,
         help="Maximum recursive scan depth for developer roots.",
     )
+    parser.add_argument(
+        "--no-duplicates",
+        action="store_true",
+        help="Skip exact duplicate hashing. Useful for a faster scan.",
+    )
+    parser.add_argument(
+        "--duplicate-min-mb",
+        type=int,
+        default=DEFAULT_DUPLICATE_MIN_BYTES // (1024 * 1024),
+        help="Minimum file size in MB for duplicate hashing.",
+    )
     return parser.parse_args()
 
 
@@ -255,11 +283,15 @@ class StorageScanner:
         min_target_bytes: int = DEFAULT_MIN_TARGET_BYTES,
         large_file_bytes: int = DEFAULT_LARGE_FILE_BYTES,
         max_depth: int = DEFAULT_MAX_DEPTH,
+        duplicate_scan: bool = True,
+        duplicate_min_bytes: int = DEFAULT_DUPLICATE_MIN_BYTES,
     ) -> None:
         self.scan_roots = [safe_resolve(path) for path in scan_roots] if scan_roots else self._default_dev_roots()
         self.min_target_bytes = min_target_bytes
         self.large_file_bytes = large_file_bytes
         self.max_depth = max_depth
+        self.duplicate_scan = duplicate_scan
+        self.duplicate_min_bytes = duplicate_min_bytes
         self.warnings: list[str] = []
 
     def scan(self) -> ScanResult:
@@ -282,6 +314,10 @@ class StorageScanner:
 
         targets = self._dedupe_targets(targets)
         targets.sort(key=lambda item: item.size_bytes, reverse=True)
+        duplicate_groups = self._scan_duplicates() if self.duplicate_scan else []
+        targets.extend(self._duplicate_targets(duplicate_groups))
+        targets = self._dedupe_targets(targets)
+        targets.sort(key=lambda item: item.size_bytes, reverse=True)
         large_dirs = [target for target in targets if target.size_bytes >= self.min_target_bytes and target.path.is_dir()]
         organizer_buckets = build_organizer_buckets(large_files)
         storage_heatmap = build_storage_heatmap(targets, downloads_breakdown)
@@ -293,6 +329,7 @@ class StorageScanner:
             organizer_buckets=organizer_buckets,
             downloads_breakdown=downloads_breakdown,
             storage_heatmap=storage_heatmap,
+            duplicate_groups=duplicate_groups,
             warnings=self.warnings,
         )
 
@@ -959,6 +996,92 @@ class StorageScanner:
                 )
         return targets
 
+    def _scan_duplicates(self) -> list[DuplicateGroup]:
+        roots = [
+            HOME / "Downloads",
+            HOME / "Desktop",
+            HOME / "Pictures" / "Screenshots",
+            HOME / "Movies",
+            *self.scan_roots,
+        ]
+        seen_paths: set[Path] = set()
+        size_groups: dict[int, list[Path]] = defaultdict(list)
+
+        for root in roots:
+            if not root.exists():
+                continue
+            max_depth = 1 if root == HOME / "Desktop" else 5
+            for file_path in self._walk_review_files(root, max_depth=max_depth):
+                resolved = safe_resolve(file_path)
+                if resolved in seen_paths:
+                    continue
+                seen_paths.add(resolved)
+                if file_path.suffix.lower() not in DUPLICATE_SCAN_EXTENSIONS:
+                    continue
+                try:
+                    size = file_path.stat().st_size
+                except (OSError, PermissionError):
+                    continue
+                if size < self.duplicate_min_bytes:
+                    continue
+                size_groups[size].append(file_path)
+
+        duplicate_groups: list[DuplicateGroup] = []
+        for size, paths in size_groups.items():
+            if len(paths) < 2:
+                continue
+            hash_groups: dict[str, list[Path]] = defaultdict(list)
+            for path in paths:
+                digest = sha256_file(path)
+                if digest:
+                    hash_groups[digest].append(path)
+
+            for digest, hashed_paths in hash_groups.items():
+                if len(hashed_paths) < 2:
+                    continue
+                hashed_paths.sort(key=lambda item: (file_modified_at(item), str(item)), reverse=True)
+                keep_path = hashed_paths[0]
+                duplicate_paths = tuple(hashed_paths[1:])
+                duplicate_groups.append(
+                    DuplicateGroup(
+                        digest=digest,
+                        file_size=size,
+                        reclaimable_bytes=size * len(duplicate_paths),
+                        keep_path=keep_path,
+                        duplicate_paths=duplicate_paths,
+                        category=self._file_category(keep_path),
+                    )
+                )
+
+        duplicate_groups.sort(key=lambda item: item.reclaimable_bytes, reverse=True)
+        return duplicate_groups
+
+    def _duplicate_targets(self, groups: list[DuplicateGroup]) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        for group in groups:
+            downloads_only = all(is_relative_to(path, HOME / "Downloads") for path in group.duplicate_paths)
+            targets.append(
+                CleanupTarget(
+                    name=f"Duplicate files: {group.keep_path.name}",
+                    path=group.duplicate_paths[0],
+                    size_bytes=group.reclaimable_bytes,
+                    risk=RISK_REVIEW,
+                    recommended=False,
+                    category="duplicates",
+                    reason="Exact duplicate files found. The newest copy is kept; review duplicate paths before deleting.",
+                    paths=group.duplicate_paths,
+                    deletable=downloads_only,
+                    details={
+                        "confidence": "90%" if downloads_only else "72%",
+                        "re_downloadable": "maybe",
+                        "keep_path": display_path(group.keep_path),
+                        "duplicate_count": str(len(group.duplicate_paths)),
+                        "cleanup_style": "exact hash duplicate",
+                    },
+                )
+            )
+        return targets
+
     def _scan_large_files(self) -> list[LargeFile]:
         files: list[LargeFile] = []
         roots = [*self.scan_roots]
@@ -1244,6 +1367,7 @@ def heatmap_name_for_category(category: str) -> str:
         "xcode": "Xcode Developer Data",
         "ai-models": "AI Models",
         "git-repo": "Git Repos",
+        "duplicates": "Duplicates",
     }
     return mapping.get(category, category.replace("-", " ").title())
 
@@ -1266,6 +1390,7 @@ def heatmap_recommendation(name: str) -> str:
         "Xcode Developer Data": "Use Xcode Organizer or simulator tools for cleanup.",
         "AI Models": "Model caches are usually re-downloadable but can be needed offline.",
         "Git Repos": "Look for build output, datasets, binaries, or missing Git LFS usage.",
+        "Duplicates": "Exact duplicates are ranked by reclaimable space; keep one copy intentionally.",
     }
     return recommendations.get(name, "Review manually.")
 
@@ -1413,6 +1538,17 @@ def dedupe_large_files(files: list[LargeFile]) -> list[LargeFile]:
     return deduped
 
 
+def sha256_file(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except (OSError, PermissionError):
+        return None
+    return digest.hexdigest()
+
+
 def write_report(result: ScanResult, output_path: Path) -> None:
     output_path = output_path.expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1461,6 +1597,7 @@ def build_report(result: ScanResult) -> str:
 
     lines.extend(storage_heatmap_section(result))
     lines.extend(downloads_breakdown_section(result))
+    lines.extend(duplicates_section(result))
 
     lines.extend(["", "---", "", "## Large Files Over 1 GB", "", "| File | Size | Last Modified | Last Opened |", "|---|---:|---|---|"])
     for file in result.large_files:
@@ -1574,6 +1711,31 @@ def downloads_breakdown_section(result: ScanResult) -> list[str]:
     return lines
 
 
+def duplicates_section(result: ScanResult) -> list[str]:
+    lines = [
+        "",
+        "---",
+        "",
+        "## Exact Duplicate Files",
+        "",
+        "| Reclaimable | Copies To Review | Kept Copy | Duplicate Paths |",
+        "|---:|---:|---|---|",
+    ]
+
+    if not result.duplicate_groups:
+        lines.append("| 0 B | 0 | None | No exact duplicate groups found above the duplicate threshold. |")
+        return lines
+
+    for group in result.duplicate_groups[:25]:
+        duplicate_paths = "<br>".join(markdown_escape(display_path(path)) for path in group.duplicate_paths[:5])
+        if len(group.duplicate_paths) > 5:
+            duplicate_paths += f"<br>... and {len(group.duplicate_paths) - 5} more"
+        lines.append(
+            f"| {bytes_to_human(group.reclaimable_bytes)} | {len(group.duplicate_paths)} | {markdown_escape(display_path(group.keep_path))} | {duplicate_paths} |"
+        )
+    return lines
+
+
 def print_targets(targets: list[CleanupTarget]) -> None:
     print("\nPotential cleanup targets:")
     if not targets:
@@ -1599,6 +1761,16 @@ def print_storage_heatmap(buckets: list[StorageBucket]) -> None:
         return
     for bucket in buckets[:8]:
         print(f"- {bucket.name:<18} {bytes_to_human(bucket.size_bytes):>10}  {bucket.count} items")
+
+
+def print_duplicate_summary(groups: list[DuplicateGroup], report_path: Path) -> None:
+    print("\nDuplicate scan:")
+    if not groups:
+        print("No exact duplicate groups found above the duplicate threshold.")
+        return
+    reclaimable = sum(group.reclaimable_bytes for group in groups)
+    print(f"{len(groups)} exact duplicate groups found, {bytes_to_human(reclaimable)} potentially reclaimable.")
+    print(f"Duplicate details are in {display_path(report_path)}.")
 
 
 def print_organizer_summary(buckets: list[OrganizerBucket], report_path: Path) -> None:
