@@ -56,9 +56,21 @@ PROTECTED_SCAN_ROOTS = {
 ORGANIZER_ACTIONS = {
     "installer": "Review installers. Most old .dmg and .pkg files can be deleted after installation.",
     "archive": "Review archives. Keep only source archives that cannot be downloaded again.",
+    "screenshot": "Review old screenshots. Archive the few useful ones and delete debugging or throwaway captures.",
     "video": "Move wanted videos to a media folder or external storage; delete throwaway captures.",
+    "pdf": "Review old PDFs. Keep course material and papers you still use; remove duplicate downloads.",
     "large-file": "Review manually. Large files are not safe to classify automatically.",
 }
+
+SCREENSHOT_NAME_PATTERNS = ("screenshot", "screen shot")
+SCREENSHOT_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
+INSTALLER_EXTENSIONS = {".dmg", ".pkg"}
+ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz"}
+PDF_EXTENSIONS = {".pdf"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".heic", ".webp"}
+DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".md"}
+CODE_ARCHIVE_EXTENSIONS = {".xcodeproj", ".xcworkspace"}
 
 
 @dataclass(frozen=True)
@@ -100,6 +112,7 @@ class LargeFile:
     path: Path
     size_bytes: int
     modified_at: datetime
+    accessed_at: datetime
     category: str
 
 
@@ -112,11 +125,21 @@ class OrganizerBucket:
 
 
 @dataclass(frozen=True)
+class StorageBucket:
+    name: str
+    size_bytes: int
+    count: int
+    recommendation: str
+
+
+@dataclass(frozen=True)
 class ScanResult:
     targets: list[CleanupTarget]
     large_files: list[LargeFile]
     large_directories: list[CleanupTarget]
     organizer_buckets: list[OrganizerBucket]
+    downloads_breakdown: list[StorageBucket]
+    storage_heatmap: list[StorageBucket]
     warnings: list[str]
 
 
@@ -143,6 +166,7 @@ def main() -> int:
     write_report(result, args.report)
     print(f"\nCleanup report written to {display_path(args.report)}")
     print_targets(targets)
+    print_storage_heatmap(result.storage_heatmap)
     print_organizer_summary(result.organizer_buckets, args.report)
 
     if args.dry_run:
@@ -245,19 +269,26 @@ class StorageScanner:
         targets.extend(self._scan_dev_junk())
         targets.extend(self._scan_docker())
 
-        large_files = self._scan_large_files()
-        targets.extend(self._targets_for_download_files(large_files))
+        download_targets, download_files, downloads_breakdown = self._scan_downloads()
+        media_targets, media_files = self._scan_user_media()
+        targets.extend(download_targets)
+        targets.extend(media_targets)
+
+        large_files = dedupe_large_files([*self._scan_large_files(), *download_files, *media_files])
 
         targets = self._dedupe_targets(targets)
         targets.sort(key=lambda item: item.size_bytes, reverse=True)
         large_dirs = [target for target in targets if target.size_bytes >= self.min_target_bytes and target.path.is_dir()]
         organizer_buckets = build_organizer_buckets(large_files)
+        storage_heatmap = build_storage_heatmap(targets, downloads_breakdown)
 
         return ScanResult(
             targets=targets,
             large_files=large_files,
             large_directories=large_dirs,
             organizer_buckets=organizer_buckets,
+            downloads_breakdown=downloads_breakdown,
+            storage_heatmap=storage_heatmap,
             warnings=self.warnings,
         )
 
@@ -341,6 +372,7 @@ class StorageScanner:
                 recommended=recommended,
                 category=category,
                 reason=reason,
+                details=confidence_details(category, risk, reason, recommended),
             )
         return targets
 
@@ -466,9 +498,233 @@ class StorageScanner:
             for child in children:
                 stack.append((child, depth + 1))
 
+    def _scan_downloads(self) -> tuple[list[CleanupTarget], list[LargeFile], list[StorageBucket]]:
+        root = HOME / "Downloads"
+        targets: list[CleanupTarget] = []
+        files: list[LargeFile] = []
+        bucket_sizes: dict[str, int] = defaultdict(int)
+        bucket_counts: dict[str, int] = defaultdict(int)
+
+        if not root.exists():
+            return targets, files, []
+
+        for file_path in self._walk_review_files(root, max_depth=4):
+            try:
+                stat = file_path.stat()
+            except (OSError, PermissionError):
+                continue
+
+            category = self._file_category(file_path)
+            size = stat.st_size
+            bucket_sizes[category] += size
+            bucket_counts[category] += 1
+
+            large_file = LargeFile(
+                path=file_path,
+                size_bytes=size,
+                modified_at=datetime.fromtimestamp(stat.st_mtime),
+                accessed_at=datetime.fromtimestamp(stat.st_atime),
+                category=category,
+            )
+
+            if size >= self.large_file_bytes or self._is_interesting_download(file_path, size):
+                files.append(large_file)
+
+            target = self._download_target_for_file(file_path, size, category, large_file)
+            if target:
+                targets.append(target)
+
+        buckets = [
+            StorageBucket(
+                name=name.replace("-", " ").title(),
+                size_bytes=bucket_sizes[name],
+                count=bucket_counts[name],
+                recommendation=downloads_recommendation(name),
+            )
+            for name in sorted(bucket_sizes, key=lambda key: bucket_sizes[key], reverse=True)
+        ]
+        return targets, files, buckets
+
+    def _scan_user_media(self) -> tuple[list[CleanupTarget], list[LargeFile]]:
+        targets: list[CleanupTarget] = []
+        files: list[LargeFile] = []
+        scan_roots = [
+            HOME / "Desktop",
+            HOME / "Pictures" / "Screenshots",
+            HOME / "Movies",
+        ]
+
+        for root in scan_roots:
+            if not root.exists():
+                continue
+            depth = 1 if root == HOME / "Desktop" else 5
+            for file_path in self._walk_review_files(root, max_depth=depth):
+                try:
+                    stat = file_path.stat()
+                except (OSError, PermissionError):
+                    continue
+
+                category = self._file_category(file_path)
+                if category not in {"screenshot", "video", "pdf"}:
+                    continue
+
+                item = LargeFile(
+                    path=file_path,
+                    size_bytes=stat.st_size,
+                    modified_at=datetime.fromtimestamp(stat.st_mtime),
+                    accessed_at=datetime.fromtimestamp(stat.st_atime),
+                    category=category,
+                )
+
+                should_track = category == "screenshot" or stat.st_size >= self.min_target_bytes
+                if should_track:
+                    files.append(item)
+
+                target = self._media_target_for_file(file_path, stat.st_size, category, item)
+                if target:
+                    targets.append(target)
+
+        screenshot_targets = self._group_old_screenshots([file for file in files if file.category == "screenshot"])
+        targets.extend(screenshot_targets)
+        return targets, files
+
+    def _download_target_for_file(self, path: Path, size: int, category: str, file: LargeFile) -> CleanupTarget | None:
+        if size < self.min_target_bytes:
+            return None
+
+        details = file_score_details(path, category, file)
+        reason = "Large Downloads files should be reviewed before deletion."
+        recommended = False
+
+        if category == "installer":
+            app_match = matching_installed_app(path)
+            if app_match:
+                details["installed_app"] = app_match
+                details["confidence"] = "88%"
+                recommended = True
+                reason = f"Installer appears re-downloadable and {app_match} is already installed."
+            elif age_days(file.modified_at) >= 30:
+                details["confidence"] = "72%"
+                recommended = True
+                reason = "Old installer files are usually removable after installation."
+        elif category == "archive":
+            extracted = matching_extracted_folder(path)
+            if extracted:
+                details["extracted_folder"] = display_path(extracted)
+                details["confidence"] = "82%"
+                recommended = True
+                reason = "Archive appears to have a matching extracted folder."
+            elif age_days(file.modified_at) >= 90:
+                details["confidence"] = "58%"
+                reason = "Old archives can be large, but may contain source material; review first."
+        elif category == "video":
+            if age_days(file.modified_at) >= 180:
+                details["confidence"] = "48%"
+                reason = "Large old video. Confirm it is not a lecture, project export, or personal recording."
+        elif category == "pdf":
+            if unused_days(file.accessed_at) >= 180:
+                details["confidence"] = "42%"
+                reason = "Large PDF not accessed recently. Review before deleting."
+
+        return CleanupTarget(
+            name=f"{category.title()} file: {path.name}",
+            path=path,
+            size_bytes=size,
+            risk=RISK_REVIEW,
+            recommended=recommended,
+            category=category,
+            reason=reason,
+            details=details,
+        )
+
+    def _media_target_for_file(self, path: Path, size: int, category: str, file: LargeFile) -> CleanupTarget | None:
+        if category == "screenshot":
+            return None
+        if size < self.large_file_bytes and category != "pdf":
+            return None
+        if category == "pdf" and (size < self.min_target_bytes or unused_days(file.accessed_at) < 180):
+            return None
+
+        details = file_score_details(path, category, file)
+        reason = "Large media/document file should be reviewed before deletion."
+        if category == "video":
+            reason = "Large video or screen recording. Review age and usefulness before deleting."
+        elif category == "pdf":
+            reason = "Large PDF not opened recently. Review before deleting."
+
+        return CleanupTarget(
+            name=f"{category.title()} file: {path.name}",
+            path=path,
+            size_bytes=size,
+            risk=RISK_REVIEW,
+            recommended=False,
+            category=category,
+            reason=reason,
+            details=details,
+        )
+
+    def _group_old_screenshots(self, screenshots: list[LargeFile]) -> list[CleanupTarget]:
+        if not screenshots:
+            return []
+
+        older_than_30 = [item for item in screenshots if age_days(item.modified_at) >= 30]
+        older_than_60 = [item for item in screenshots if age_days(item.modified_at) >= 60]
+        never_reopened = [item for item in screenshots if item.accessed_at <= item.modified_at]
+        grouped_size = sum(item.size_bytes for item in older_than_60)
+
+        if not older_than_60 or grouped_size <= 0:
+            return []
+
+        details = {
+            "confidence": "64%",
+            "re_downloadable": "no",
+            "total_screenshots": str(len(screenshots)),
+            "older_than_30_days": str(len(older_than_30)),
+            "older_than_60_days": str(len(older_than_60)),
+            "never_accessed_after_creation": str(len(never_reopened)),
+        }
+        return [
+            CleanupTarget(
+                name="Old screenshots",
+                path=older_than_60[0].path,
+                size_bytes=grouped_size,
+                risk=RISK_REVIEW,
+                recommended=False,
+                category="screenshot",
+                reason="Old screenshots often become low-value clutter, but they may contain notes or personal context.",
+                paths=tuple(item.path for item in older_than_60),
+                details=details,
+            )
+        ]
+
+    def _is_interesting_download(self, path: Path, size: int) -> bool:
+        category = self._file_category(path)
+        if size >= self.min_target_bytes:
+            return category in {"installer", "archive", "video", "pdf", "screenshot", "image", "dataset", "large-file"}
+        return category in {"installer", "archive"}
+
+    def _walk_review_files(self, root: Path, max_depth: int):
+        stack: list[tuple[Path, int]] = [(safe_resolve(root), 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth > max_depth or current.is_symlink():
+                continue
+            if current.is_file():
+                yield current
+                continue
+            if is_system_protected_path(current):
+                continue
+            if current.name in {".git", ".svn", ".hg", "node_modules", ".venv", "venv", "__pycache__"}:
+                continue
+            try:
+                for child in current.iterdir():
+                    stack.append((child, depth + 1))
+            except (OSError, PermissionError):
+                continue
+
     def _scan_large_files(self) -> list[LargeFile]:
         files: list[LargeFile] = []
-        roots = [HOME / "Downloads", *self.scan_roots]
+        roots = [*self.scan_roots]
 
         for root in roots:
             if not root.exists() or should_prune_scan_dir(root):
@@ -487,6 +743,7 @@ class StorageScanner:
                             path=file_path,
                             size_bytes=size,
                             modified_at=file_modified_at(file_path),
+                            accessed_at=file_accessed_at(file_path),
                             category=self._file_category(file_path),
                         )
                     )
@@ -517,12 +774,22 @@ class StorageScanner:
 
     def _file_category(self, path: Path) -> str:
         suffix = path.suffix.lower()
-        if suffix in {".dmg", ".pkg"}:
+        if is_screenshot(path):
+            return "screenshot"
+        if suffix in INSTALLER_EXTENSIONS:
             return "installer"
-        if suffix in {".zip", ".tar", ".gz", ".tgz", ".rar", ".7z"}:
+        if suffix in ARCHIVE_EXTENSIONS:
             return "archive"
-        if suffix in {".mp4", ".mov", ".mkv", ".avi"}:
+        if suffix in VIDEO_EXTENSIONS:
             return "video"
+        if suffix in PDF_EXTENSIONS:
+            return "pdf"
+        if suffix in IMAGE_EXTENSIONS:
+            return "image"
+        if suffix in DOCUMENT_EXTENSIONS:
+            return "document"
+        if suffix in {".csv", ".tsv", ".json", ".jsonl", ".parquet", ".sqlite", ".db"}:
+            return "dataset"
         return "large-file"
 
     def _targets_for_download_files(self, large_files: list[LargeFile]) -> list[CleanupTarget]:
@@ -694,6 +961,209 @@ def build_organizer_buckets(files: list[LargeFile]) -> list[OrganizerBucket]:
     return buckets
 
 
+def build_storage_heatmap(targets: list[CleanupTarget], downloads_breakdown: list[StorageBucket]) -> list[StorageBucket]:
+    grouped_size: dict[str, int] = defaultdict(int)
+    grouped_count: dict[str, int] = defaultdict(int)
+
+    for target in targets:
+        name = heatmap_name_for_category(target.category)
+        grouped_size[name] += target.size_bytes
+        grouped_count[name] += 1
+
+    for bucket in downloads_breakdown:
+        grouped_size["Downloads"] += bucket.size_bytes
+        grouped_count["Downloads"] += bucket.count
+
+    buckets = [
+        StorageBucket(
+            name=name,
+            size_bytes=size,
+            count=grouped_count[name],
+            recommendation=heatmap_recommendation(name),
+        )
+        for name, size in grouped_size.items()
+        if size > 0
+    ]
+    buckets.sort(key=lambda item: item.size_bytes, reverse=True)
+    return buckets
+
+
+def heatmap_name_for_category(category: str) -> str:
+    mapping = {
+        "cache": "Caches",
+        "logs": "Logs",
+        "environment": "Dev Environments",
+        "developer-junk": "Developer Junk",
+        "developer-junk-small": "Developer Junk",
+        "installer": "Installers",
+        "archive": "Archives",
+        "video": "Videos",
+        "screenshot": "Screenshots",
+        "pdf": "PDFs",
+        "docker": "Docker",
+    }
+    return mapping.get(category, category.replace("-", " ").title())
+
+
+def heatmap_recommendation(name: str) -> str:
+    recommendations = {
+        "Caches": "Usually the first place to recover space; prefer SAFE cache targets first.",
+        "Downloads": "Classify before deleting. Installers and extracted archives are often low value.",
+        "Screenshots": "Archive useful screenshots and delete old debugging or throwaway captures.",
+        "Videos": "Review old recordings and move useful ones to external storage.",
+        "PDFs": "Review old large PDFs; many are re-downloadable but course notes may not be.",
+        "Dev Environments": "Review active projects before deleting environments.",
+        "Developer Junk": "Dependencies and bytecode can often be regenerated.",
+        "Installers": "Usually re-downloadable after the app is installed.",
+        "Archives": "Delete only when extracted or re-downloadable.",
+        "Docker": "Use Docker's prune tools manually.",
+    }
+    return recommendations.get(name, "Review manually.")
+
+
+def downloads_recommendation(category: str) -> str:
+    recommendations = {
+        "installer": "Check whether the app is already installed; old installers are usually low value.",
+        "archive": "Check whether the archive was extracted or can be downloaded again.",
+        "video": "Large recordings should be archived or deleted after review.",
+        "screenshot": "Old screenshots are often safe to archive/delete after review.",
+        "image": "Review duplicates and image spam.",
+        "pdf": "Keep textbooks/notes you use; delete duplicate downloads.",
+        "document": "Review manually; documents may be important.",
+        "dataset": "Check whether the data exists elsewhere before deleting.",
+        "large-file": "Review manually.",
+    }
+    return recommendations.get(category, "Review manually.")
+
+
+def file_score_details(path: Path, category: str, file: LargeFile) -> dict[str, str]:
+    confidence = {
+        "installer": "70%",
+        "archive": "52%",
+        "video": "44%",
+        "screenshot": "58%",
+        "pdf": "38%",
+        "image": "35%",
+        "dataset": "30%",
+        "large-file": "25%",
+    }.get(category, "25%")
+    redownloadable = {
+        "installer": "yes",
+        "archive": "maybe",
+        "video": "maybe",
+        "screenshot": "no",
+        "pdf": "maybe",
+        "image": "maybe",
+        "dataset": "maybe",
+    }.get(category, "maybe")
+    return {
+        "confidence": confidence,
+        "re_downloadable": redownloadable,
+        "age_days": str(age_days(file.modified_at)),
+        "unused_days": str(unused_days(file.accessed_at)),
+        "last_modified": file.modified_at.strftime("%Y-%m-%d"),
+        "last_opened": file.accessed_at.strftime("%Y-%m-%d"),
+        "extension": path.suffix.lower() or "(none)",
+    }
+
+
+def confidence_details(category: str, risk: str, reason: str, recommended: bool) -> dict[str, str]:
+    if category == "cache" and risk == RISK_SAFE:
+        confidence = "94%"
+        redownloadable = "yes"
+    elif category == "cache":
+        confidence = "72%"
+        redownloadable = "yes"
+    elif category == "logs":
+        confidence = "82%"
+        redownloadable = "no"
+    elif recommended:
+        confidence = "70%"
+        redownloadable = "maybe"
+    else:
+        confidence = "45%"
+        redownloadable = "maybe"
+    return {
+        "confidence": confidence,
+        "re_downloadable": redownloadable,
+        "basis": reason,
+    }
+
+
+def is_screenshot(path: Path) -> bool:
+    if path.suffix.lower() not in SCREENSHOT_EXTENSIONS:
+        return False
+    name = path.name.lower()
+    return any(pattern in name for pattern in SCREENSHOT_NAME_PATTERNS)
+
+
+def matching_installed_app(path: Path) -> str | None:
+    app_root = Path("/Applications")
+    if not app_root.exists():
+        return None
+
+    stem = normalize_name(path.stem)
+    if not stem:
+        return None
+    try:
+        apps = [item for item in app_root.iterdir() if item.suffix.lower() == ".app"]
+    except (OSError, PermissionError):
+        return None
+
+    for app in apps:
+        app_name = normalize_name(app.stem)
+        if not app_name:
+            continue
+        if app_name in stem or stem in app_name:
+            return app.name
+        if "chrome" in stem and "chrome" in app_name:
+            return app.name
+        if "vscode" in stem and ("visualstudiocode" in app_name or "code" == app_name):
+            return app.name
+    return None
+
+
+def matching_extracted_folder(path: Path) -> Path | None:
+    candidates = []
+    stem = path.name
+    for suffix in sorted(ARCHIVE_EXTENSIONS, key=len, reverse=True):
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    candidates.append(path.with_name(stem))
+    candidates.append(path.with_name(path.stem))
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def normalize_name(value: str) -> str:
+    value = re.sub(r"\d+(\.\d+)*", "", value.lower())
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def age_days(when: datetime) -> int:
+    return max(0, (datetime.now() - when).days)
+
+
+def unused_days(when: datetime) -> int:
+    return max(0, (datetime.now() - when).days)
+
+
+def dedupe_large_files(files: list[LargeFile]) -> list[LargeFile]:
+    seen: set[Path] = set()
+    deduped: list[LargeFile] = []
+    for file in sorted(files, key=lambda item: item.size_bytes, reverse=True):
+        resolved = safe_resolve(file.path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(file)
+    return deduped
+
+
 def write_report(result: ScanResult, output_path: Path) -> None:
     output_path = output_path.expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -718,8 +1188,8 @@ def build_report(result: ScanResult) -> str:
         "",
         "## Ranked Cleanup Suggestions",
         "",
-        "| Rank | Category | Size | Risk | Path | Reason |",
-        "|---|---|---:|---|---|---|",
+        "| Rank | Category | Size | Risk | Confidence | Re-downloadable | Path | Reason |",
+        "|---|---|---:|---|---:|---|---|---|",
     ]
 
     for index, target in enumerate(result.targets, start=1):
@@ -731,6 +1201,8 @@ def build_report(result: ScanResult) -> str:
                     markdown_escape(target.name),
                     bytes_to_human(target.size_bytes),
                     target.risk,
+                    target.details.get("confidence", "-"),
+                    target.details.get("re_downloadable", "-"),
                     markdown_escape(target_path_label(target)),
                     markdown_escape(target.reason),
                 ]
@@ -738,12 +1210,15 @@ def build_report(result: ScanResult) -> str:
             + " |"
         )
 
-    lines.extend(["", "---", "", "## Large Files Over 1 GB", "", "| File | Size | Last Modified |", "|---|---:|---|"])
+    lines.extend(storage_heatmap_section(result))
+    lines.extend(downloads_breakdown_section(result))
+
+    lines.extend(["", "---", "", "## Large Files Over 1 GB", "", "| File | Size | Last Modified | Last Opened |", "|---|---:|---|---|"])
     for file in result.large_files:
         if file.size_bytes < 1024**3:
             continue
         lines.append(
-            f"| {markdown_escape(display_path(file.path))} | {bytes_to_human(file.size_bytes)} | {file.modified_at.strftime('%Y-%m-%d %H:%M')} |"
+            f"| {markdown_escape(display_path(file.path))} | {bytes_to_human(file.size_bytes)} | {file.modified_at.strftime('%Y-%m-%d %H:%M')} | {file.accessed_at.strftime('%Y-%m-%d %H:%M')} |"
         )
 
     lines.extend(["", "---", "", "## Large Directories", "", "| Folder | Size |", "|---|---:|"])
@@ -808,6 +1283,48 @@ def organizer_report_section(result: ScanResult) -> list[str]:
     return lines
 
 
+def storage_heatmap_section(result: ScanResult) -> list[str]:
+    lines = [
+        "",
+        "---",
+        "",
+        "## Storage Heatmap",
+        "",
+        "| Area | Size | Items | Recommendation |",
+        "|---|---:|---:|---|",
+    ]
+    if not result.storage_heatmap:
+        lines.append("| None | 0 B | 0 | No storage buckets found. |")
+        return lines
+
+    for bucket in result.storage_heatmap:
+        lines.append(
+            f"| {markdown_escape(bucket.name)} | {bytes_to_human(bucket.size_bytes)} | {bucket.count} | {markdown_escape(bucket.recommendation)} |"
+        )
+    return lines
+
+
+def downloads_breakdown_section(result: ScanResult) -> list[str]:
+    lines = [
+        "",
+        "---",
+        "",
+        "## Downloads Breakdown",
+        "",
+        "| Type | Size | Files | Recommendation |",
+        "|---|---:|---:|---|",
+    ]
+    if not result.downloads_breakdown:
+        lines.append("| None | 0 B | 0 | Downloads folder not found or empty. |")
+        return lines
+
+    for bucket in result.downloads_breakdown:
+        lines.append(
+            f"| {markdown_escape(bucket.name)} | {bytes_to_human(bucket.size_bytes)} | {bucket.count} | {markdown_escape(bucket.recommendation)} |"
+        )
+    return lines
+
+
 def print_targets(targets: list[CleanupTarget]) -> None:
     print("\nPotential cleanup targets:")
     if not targets:
@@ -824,6 +1341,15 @@ def print_targets(targets: list[CleanupTarget]) -> None:
         )
 
     print("\n* recommended by the scanner")
+
+
+def print_storage_heatmap(buckets: list[StorageBucket]) -> None:
+    print("\nTop storage areas:")
+    if not buckets:
+        print("No storage heatmap buckets found.")
+        return
+    for bucket in buckets[:8]:
+        print(f"- {bucket.name:<18} {bytes_to_human(bucket.size_bytes):>10}  {bucket.count} items")
 
 
 def print_organizer_summary(buckets: list[OrganizerBucket], report_path: Path) -> None:
@@ -1022,6 +1548,13 @@ def path_size(path: Path) -> int:
 def file_modified_at(path: Path) -> datetime:
     try:
         return datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return datetime.fromtimestamp(0)
+
+
+def file_accessed_at(path: Path) -> datetime:
+    try:
+        return datetime.fromtimestamp(path.stat().st_atime)
     except OSError:
         return datetime.fromtimestamp(0)
 
