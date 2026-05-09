@@ -19,6 +19,9 @@ python3 cleanup.py
 
 # faster scan without duplicate hashing
 python3 cleanup.py --dry-run --no-duplicates
+
+# slower scan that includes app bundle sizing
+python3 cleanup.py --dry-run --scan-apps
 ```
 
 Useful flags:
@@ -27,6 +30,7 @@ Useful flags:
 --scan-root ~/Desktop/Projects
 --min-target-mb 250
 --duplicate-min-mb 500
+--deep
 --report cleanup_report.md
 --log cleanup_log.txt
 ```
@@ -50,6 +54,7 @@ Useful flags:
 - Source repos and `.git` folders are protected.
 - System paths are protected.
 - Manual-only targets are reported but not deleted by the tool.
+- Live app caches may only partially clear; close the app and rerun if files remain.
 
 Protected roots include `~/Documents`, `~/Desktop`, `~/Pictures`, `~/Movies`, `~/Music`, `~/Applications`, `/System`, `/Library`, `/usr`, `/bin`, `/sbin`, and `/Applications`.
 

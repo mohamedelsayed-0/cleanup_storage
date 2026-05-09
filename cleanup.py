@@ -6,6 +6,7 @@ import hashlib
 import re
 import shutil
 import subprocess
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +23,7 @@ DEFAULT_MIN_TARGET_BYTES = 100 * 1024 * 1024
 DEFAULT_LARGE_FILE_BYTES = 1024**3
 DEFAULT_MAX_DEPTH = 8
 DEFAULT_DUPLICATE_MIN_BYTES = 50 * 1024 * 1024
+DU_TIMEOUT_SECONDS = 12
 
 PROTECTED_EXACT_PATHS = {
     HOME,
@@ -75,6 +77,18 @@ DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"
 CODE_ARCHIVE_EXTENSIONS = {".xcodeproj", ".xcworkspace"}
 MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx"}
 DUPLICATE_SCAN_EXTENSIONS = SCREENSHOT_EXTENSIONS | VIDEO_EXTENSIONS | INSTALLER_EXTENSIONS | ARCHIVE_EXTENSIONS | PDF_EXTENSIONS | IMAGE_EXTENSIONS | MODEL_EXTENSIONS
+KNOWN_HEAVY_APP_SUPPORT_DIRS = (
+    "Claude",
+    "Google",
+    "Steam",
+    "Notion",
+    "Code",
+    "discord",
+    "Spotify",
+    "Docker Desktop",
+    "Cursor",
+    "com.openai.chat",
+)
 
 
 @dataclass(frozen=True)
@@ -176,6 +190,8 @@ def main() -> int:
         max_depth=args.max_depth,
         duplicate_scan=not args.no_duplicates,
         duplicate_min_bytes=args.duplicate_min_mb * 1024 * 1024,
+        deep_scan=args.deep,
+        scan_apps=args.scan_apps or args.deep,
     )
     result = scanner.scan()
     targets = result.targets
@@ -208,7 +224,10 @@ def main() -> int:
     print("\nDeletion summary:")
     for item in results:
         if item.deleted_paths:
-            print(f"- Deleted {item.target.name}: {bytes_to_human(item.recovered_bytes)}")
+            if item.skipped_paths:
+                print(f"- Partially cleaned {item.target.name}: {bytes_to_human(item.recovered_bytes)}")
+            else:
+                print(f"- Deleted {item.target.name}: {bytes_to_human(item.recovered_bytes)}")
         for skipped in item.skipped_paths:
             print(f"- Skipped {skipped}")
 
@@ -273,6 +292,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DUPLICATE_MIN_BYTES // (1024 * 1024),
         help="Minimum file size in MB for duplicate hashing.",
     )
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Run slower storage-intelligence scans, including all Application Support folders and app bundles.",
+    )
+    parser.add_argument(
+        "--scan-apps",
+        action="store_true",
+        help="Rank installed apps in /Applications. Slower on large app bundles.",
+    )
     return parser.parse_args()
 
 
@@ -285,6 +314,8 @@ class StorageScanner:
         max_depth: int = DEFAULT_MAX_DEPTH,
         duplicate_scan: bool = True,
         duplicate_min_bytes: int = DEFAULT_DUPLICATE_MIN_BYTES,
+        deep_scan: bool = False,
+        scan_apps: bool = False,
     ) -> None:
         self.scan_roots = [safe_resolve(path) for path in scan_roots] if scan_roots else self._default_dev_roots()
         self.min_target_bytes = min_target_bytes
@@ -292,6 +323,8 @@ class StorageScanner:
         self.max_depth = max_depth
         self.duplicate_scan = duplicate_scan
         self.duplicate_min_bytes = duplicate_min_bytes
+        self.deep_scan = deep_scan
+        self.scan_apps = scan_apps
         self.warnings: list[str] = []
 
     def scan(self) -> ScanResult:
@@ -767,7 +800,10 @@ class StorageScanner:
         targets: list[CleanupTarget] = []
         targets.extend(self._scan_messages_attachments())
         targets.extend(self._scan_application_support())
-        targets.extend(self._scan_applications())
+        if self.scan_apps:
+            targets.extend(self._scan_applications())
+        else:
+            self.warnings.append("Skipped /Applications bundle sizing. Run with --scan-apps or --deep to include it.")
         targets.extend(self._scan_xcode_developer_data())
         return targets
 
@@ -775,7 +811,7 @@ class StorageScanner:
         path = HOME / "Library" / "Messages" / "Attachments"
         if not path.exists():
             return []
-        size = directory_size(path)
+        size = measured_directory_size(path)
         if size < self.min_target_bytes:
             return []
         return [
@@ -802,12 +838,15 @@ class StorageScanner:
         if not root.exists():
             return targets
         try:
-            children = [child for child in root.iterdir() if child.is_dir() and not child.is_symlink()]
+            if self.deep_scan:
+                children = [child for child in root.iterdir() if child.is_dir() and not child.is_symlink()]
+            else:
+                children = [root / name for name in KNOWN_HEAVY_APP_SUPPORT_DIRS if (root / name).is_dir()]
         except (OSError, PermissionError):
             return targets
 
         for child in children:
-            size = directory_size(child)
+            size = measured_directory_size(child)
             if size < self.min_target_bytes:
                 continue
             targets.append(
@@ -840,7 +879,7 @@ class StorageScanner:
             return targets
 
         for app in apps:
-            size = directory_size(app)
+            size = measured_directory_size(app)
             if size < self.min_target_bytes:
                 continue
             targets.append(
@@ -872,7 +911,7 @@ class StorageScanner:
         for name, path, reason in known:
             if not path.exists():
                 continue
-            size = directory_size(path)
+            size = measured_directory_size(path)
             if size < self.min_target_bytes:
                 continue
             targets.append(
@@ -905,7 +944,7 @@ class StorageScanner:
         for name, root, reason in model_roots:
             if not root.exists():
                 continue
-            root_size = directory_size(root)
+            root_size = measured_directory_size(root)
             if root_size >= self.min_target_bytes and name == "Ollama models":
                 targets.append(
                     CleanupTarget(
@@ -971,8 +1010,8 @@ class StorageScanner:
                 if resolved in seen:
                     continue
                 seen.add(resolved)
-                repo_size = directory_size(path)
-                git_size = directory_size(path / ".git")
+                repo_size = measured_directory_size(path)
+                git_size = measured_directory_size(path / ".git")
                 if repo_size < self.min_target_bytes and git_size < self.min_target_bytes:
                     continue
                 targets.append(
@@ -1236,7 +1275,7 @@ class Cleaner:
         for target in targets:
             result = self._delete_target(target)
             results.append(result)
-            if result.deleted_paths:
+            if result.recovered_bytes > 0:
                 self._log_result(result)
         return results
 
@@ -1261,16 +1300,45 @@ class Cleaner:
 
             size_before = path_size(path)
             try:
-                if path.is_dir():
-                    shutil.rmtree(path)
+                if should_clear_directory_contents(target, path):
+                    errors = clear_directory_contents(path)
+                    if errors:
+                        skipped.extend(errors)
+                    size_after = path_size(path) if path.exists() else 0
+                    recovered_here = max(0, size_before - size_after)
+                    if recovered_here > 0:
+                        recovered += recovered_here
+                        deleted.append(path)
+                    if size_after > 0:
+                        skipped.append(
+                            f"{display_path(path)}: {bytes_to_human(size_after)} remains; close the app and retry if this cache is still active"
+                        )
+                elif path.is_dir():
+                    remove_errors = remove_path_with_retries(path)
+                    if remove_errors:
+                        size_after = path_size(path) if path.exists() else 0
+                        recovered_here = max(0, size_before - size_after)
+                        if recovered_here > 0:
+                            recovered += recovered_here
+                            deleted.append(path)
+                        skipped.extend(remove_errors)
+                        continue
+                    recovered += size_before
+                    deleted.append(path)
                 else:
                     path.unlink()
+                    recovered += size_before
+                    deleted.append(path)
             except OSError as exc:
-                skipped.append(f"{display_path(path)}: {exc}")
+                size_after = path_size(path) if path.exists() else 0
+                recovered_here = max(0, size_before - size_after)
+                if recovered_here > 0:
+                    recovered += recovered_here
+                    deleted.append(path)
+                    skipped.append(f"{display_path(path)}: partially cleaned, then hit {exc}")
+                else:
+                    skipped.append(f"{display_path(path)}: {exc}")
                 continue
-
-            recovered += size_before
-            deleted.append(path)
 
         return DeletionResult(target, recovered, tuple(deleted), tuple(skipped))
 
@@ -1289,9 +1357,10 @@ class Cleaner:
 
     def _log_result(self, result: DeletionResult) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        action = "Partially cleaned" if result.skipped_paths else "Deleted"
         lines = [
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]",
-            f"Deleted {result.target.name}",
+            f"{action} {result.target.name}",
             f"Recovered {bytes_to_human(result.recovered_bytes)}",
         ]
         lines.extend(f"- {display_path(path)}" for path in result.deleted_paths)
@@ -1964,6 +2033,70 @@ def path_size(path: Path) -> int:
         except OSError:
             return 0
     return directory_size(path)
+
+
+def measured_directory_size(path: Path) -> int:
+    if path.is_file():
+        return path_size(path)
+
+    try:
+        result = subprocess.run(
+            ["du", "-sk", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=DU_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return 0
+    except OSError:
+        return directory_size(path)
+
+    if result.returncode == 0 and result.stdout.strip():
+        first = result.stdout.split(None, 1)[0]
+        if first.isdigit():
+            return int(first) * 1024
+    return directory_size(path)
+
+
+def should_clear_directory_contents(target: CleanupTarget, path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if target.category in {"cache", "logs"}:
+        return True
+    return is_relative_to(path, HOME / "Library" / "Caches")
+
+
+def clear_directory_contents(path: Path) -> list[str]:
+    errors: list[str] = []
+    try:
+        children = list(path.iterdir())
+    except OSError as exc:
+        return [f"{display_path(path)}: {exc}"]
+
+    for child in children:
+        errors.extend(remove_path_with_retries(child))
+    return errors[:10]
+
+
+def remove_path_with_retries(path: Path, attempts: int = 3) -> list[str]:
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            return []
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.15 * (attempt + 1))
+
+    if last_error is None:
+        return []
+    return [f"{display_path(path)}: {last_error}"]
 
 
 def file_modified_at(path: Path) -> datetime:
