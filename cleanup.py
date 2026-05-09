@@ -71,6 +71,7 @@ PDF_EXTENSIONS = {".pdf"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".heic", ".webp"}
 DOCUMENT_EXTENSIONS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".md"}
 CODE_ARCHIVE_EXTENSIONS = {".xcodeproj", ".xcworkspace"}
+MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".onnx"}
 
 
 @dataclass(frozen=True)
@@ -267,6 +268,9 @@ class StorageScanner:
         targets.extend(self._scan_conda_envs())
         targets.extend(self._scan_library_cache_children())
         targets.extend(self._scan_dev_junk())
+        targets.extend(self._scan_hidden_mac_storage())
+        targets.extend(self._scan_ai_models())
+        targets.extend(self._scan_git_bloat())
         targets.extend(self._scan_docker())
 
         download_targets, download_files, downloads_breakdown = self._scan_downloads()
@@ -722,6 +726,239 @@ class StorageScanner:
             except (OSError, PermissionError):
                 continue
 
+    def _scan_hidden_mac_storage(self) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        targets.extend(self._scan_messages_attachments())
+        targets.extend(self._scan_application_support())
+        targets.extend(self._scan_applications())
+        targets.extend(self._scan_xcode_developer_data())
+        return targets
+
+    def _scan_messages_attachments(self) -> list[CleanupTarget]:
+        path = HOME / "Library" / "Messages" / "Attachments"
+        if not path.exists():
+            return []
+        size = directory_size(path)
+        if size < self.min_target_bytes:
+            return []
+        return [
+            CleanupTarget(
+                name="Messages attachments",
+                path=path,
+                size_bytes=size,
+                risk=RISK_REVIEW,
+                recommended=False,
+                category="messages",
+                reason="Message attachments can be huge, but may include personal media; review in Messages or Finder before deleting.",
+                deletable=False,
+                details={
+                    "confidence": "35%",
+                    "re_downloadable": "no",
+                    "cleanup_style": "manual review",
+                },
+            )
+        ]
+
+    def _scan_application_support(self) -> list[CleanupTarget]:
+        root = HOME / "Library" / "Application Support"
+        targets: list[CleanupTarget] = []
+        if not root.exists():
+            return targets
+        try:
+            children = [child for child in root.iterdir() if child.is_dir() and not child.is_symlink()]
+        except (OSError, PermissionError):
+            return targets
+
+        for child in children:
+            size = directory_size(child)
+            if size < self.min_target_bytes:
+                continue
+            targets.append(
+                CleanupTarget(
+                    name=f"Application Support: {child.name}",
+                    path=child,
+                    size_bytes=size,
+                    risk=RISK_REVIEW,
+                    recommended=False,
+                    category="application-support",
+                    reason="Large Application Support folders can hold app data, accounts, and caches; inspect the app before deleting.",
+                    deletable=False,
+                    details={
+                        "confidence": "20%",
+                        "re_downloadable": "maybe",
+                        "cleanup_style": "manual app-specific cleanup",
+                    },
+                )
+            )
+        return targets
+
+    def _scan_applications(self) -> list[CleanupTarget]:
+        root = Path("/Applications")
+        targets: list[CleanupTarget] = []
+        if not root.exists():
+            return targets
+        try:
+            apps = [child for child in root.iterdir() if child.suffix.lower() == ".app" and not child.is_symlink()]
+        except (OSError, PermissionError):
+            return targets
+
+        for app in apps:
+            size = directory_size(app)
+            if size < self.min_target_bytes:
+                continue
+            targets.append(
+                CleanupTarget(
+                    name=f"Application: {app.stem}",
+                    path=app,
+                    size_bytes=size,
+                    risk=RISK_REVIEW,
+                    recommended=False,
+                    category="application",
+                    reason="Large installed app. Uninstall manually if you no longer use it.",
+                    deletable=False,
+                    details={
+                        "confidence": "15%",
+                        "re_downloadable": "maybe",
+                        "cleanup_style": "manual uninstall",
+                    },
+                )
+            )
+        return targets
+
+    def _scan_xcode_developer_data(self) -> list[CleanupTarget]:
+        known = [
+            ("Xcode archives", HOME / "Library" / "Developer" / "Xcode" / "Archives", "Project archives may be important releases; review in Xcode Organizer."),
+            ("Xcode device support", HOME / "Library" / "Developer" / "Xcode" / "iOS DeviceSupport", "Old device support data can be removed after review."),
+            ("CoreSimulator data", HOME / "Library" / "Developer" / "CoreSimulator", "Simulator devices and runtimes can be recreated but may contain app data."),
+        ]
+        targets: list[CleanupTarget] = []
+        for name, path, reason in known:
+            if not path.exists():
+                continue
+            size = directory_size(path)
+            if size < self.min_target_bytes:
+                continue
+            targets.append(
+                CleanupTarget(
+                    name=name,
+                    path=path,
+                    size_bytes=size,
+                    risk=RISK_REVIEW,
+                    recommended=False,
+                    category="xcode",
+                    reason=reason,
+                    deletable=False,
+                    details={
+                        "confidence": "55%",
+                        "re_downloadable": "maybe",
+                        "cleanup_style": "manual Xcode cleanup",
+                    },
+                )
+            )
+        return targets
+
+    def _scan_ai_models(self) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        model_roots = [
+            ("Ollama models", HOME / ".ollama" / "models", "Ollama models can usually be pulled again, but confirm you do not need them offline."),
+            ("HuggingFace model files", HOME / ".cache" / "huggingface", "Downloaded model files can usually be re-downloaded."),
+            ("Torch model files", HOME / ".cache" / "torch", "Torch checkpoints and model files can usually be re-downloaded."),
+        ]
+
+        for name, root, reason in model_roots:
+            if not root.exists():
+                continue
+            root_size = directory_size(root)
+            if root_size >= self.min_target_bytes and name == "Ollama models":
+                targets.append(
+                    CleanupTarget(
+                        name=name,
+                        path=root,
+                        size_bytes=root_size,
+                        risk=RISK_REVIEW,
+                        recommended=True,
+                        category="ai-models",
+                        reason=reason,
+                        details={
+                            "confidence": "70%",
+                            "re_downloadable": "yes",
+                            "cleanup_style": "model cache",
+                        },
+                    )
+                )
+
+            for file_path in self._walk_review_files(root, max_depth=8):
+                if file_path.suffix.lower() not in MODEL_EXTENSIONS:
+                    continue
+                try:
+                    stat = file_path.stat()
+                except (OSError, PermissionError):
+                    continue
+                if stat.st_size < self.min_target_bytes:
+                    continue
+                item = LargeFile(
+                    path=file_path,
+                    size_bytes=stat.st_size,
+                    modified_at=datetime.fromtimestamp(stat.st_mtime),
+                    accessed_at=datetime.fromtimestamp(stat.st_atime),
+                    category="ai-model",
+                )
+                targets.append(
+                    CleanupTarget(
+                        name=f"AI model: {file_path.name}",
+                        path=file_path,
+                        size_bytes=stat.st_size,
+                        risk=RISK_REVIEW,
+                        recommended=False,
+                        category="ai-models",
+                        reason=reason,
+                        details=file_score_details(file_path, "ai-model", item)
+                        | {
+                            "confidence": "64%",
+                            "re_downloadable": "yes",
+                        },
+                    )
+                )
+        return targets
+
+    def _scan_git_bloat(self) -> list[CleanupTarget]:
+        targets: list[CleanupTarget] = []
+        seen: set[Path] = set()
+        for root in self.scan_roots:
+            if not root.exists():
+                continue
+            for path in self._walk_dirs(root):
+                if not (path / ".git").exists():
+                    continue
+                resolved = safe_resolve(path)
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                repo_size = directory_size(path)
+                git_size = directory_size(path / ".git")
+                if repo_size < self.min_target_bytes and git_size < self.min_target_bytes:
+                    continue
+                targets.append(
+                    CleanupTarget(
+                        name=f"Git repo bloat: {path.name}",
+                        path=path,
+                        size_bytes=repo_size,
+                        risk=RISK_REVIEW,
+                        recommended=False,
+                        category="git-repo",
+                        reason="Large source repository detected. Do not delete automatically; check binaries, datasets, build outputs, or Git LFS.",
+                        deletable=False,
+                        details={
+                            "confidence": "10%",
+                            "re_downloadable": "no",
+                            "repo_size": bytes_to_human(repo_size),
+                            "git_metadata": bytes_to_human(git_size),
+                            "cleanup_style": "manual repo cleanup",
+                        },
+                    )
+                )
+        return targets
+
     def _scan_large_files(self) -> list[LargeFile]:
         files: list[LargeFile] = []
         roots = [*self.scan_roots]
@@ -1001,6 +1238,12 @@ def heatmap_name_for_category(category: str) -> str:
         "screenshot": "Screenshots",
         "pdf": "PDFs",
         "docker": "Docker",
+        "messages": "Messages Attachments",
+        "application-support": "Application Support",
+        "application": "Applications",
+        "xcode": "Xcode Developer Data",
+        "ai-models": "AI Models",
+        "git-repo": "Git Repos",
     }
     return mapping.get(category, category.replace("-", " ").title())
 
@@ -1017,6 +1260,12 @@ def heatmap_recommendation(name: str) -> str:
         "Installers": "Usually re-downloadable after the app is installed.",
         "Archives": "Delete only when extracted or re-downloadable.",
         "Docker": "Use Docker's prune tools manually.",
+        "Messages Attachments": "Review personal media carefully; prefer Messages/Finder review over blanket deletion.",
+        "Application Support": "Inspect app-specific data before deleting anything.",
+        "Applications": "Uninstall unused apps manually.",
+        "Xcode Developer Data": "Use Xcode Organizer or simulator tools for cleanup.",
+        "AI Models": "Model caches are usually re-downloadable but can be needed offline.",
+        "Git Repos": "Look for build output, datasets, binaries, or missing Git LFS usage.",
     }
     return recommendations.get(name, "Review manually.")
 
@@ -1171,7 +1420,7 @@ def write_report(result: ScanResult, output_path: Path) -> None:
 
 
 def build_report(result: ScanResult) -> str:
-    total = sum(target.size_bytes for target in result.targets if target.risk != RISK_DANGEROUS)
+    total = sum(target.size_bytes for target in result.targets if target.risk != RISK_DANGEROUS and target.deletable)
     safe = [target for target in result.targets if target.risk == RISK_SAFE and target.recommended]
     review = [target for target in result.targets if target.risk == RISK_REVIEW]
 
