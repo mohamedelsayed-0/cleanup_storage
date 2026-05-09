@@ -1,148 +1,59 @@
 # Mac Storage Cleanup Tool
 
-A local, dependency-free Mac storage cleanup assistant focused on developer-heavy junk: package caches, ML model caches, virtual environments, `node_modules`, Xcode build artifacts, and large Downloads files.
-
-Everything runs from one terminal script:
+One-file, terminal-based Mac storage scanner and cleanup assistant.
 
 ```bash
 python3 cleanup.py
 ```
 
-The script scans, ranks cleanup candidates by size, writes a Markdown report, asks terminal questions for target selection, and requires typing exactly `DELETE` before removing anything.
+It scans for large low-value storage, writes `cleanup_report.md`, asks what to delete in the terminal, and only deletes after you type exactly `DELETE`.
 
-## Files
-
-- `cleanup.py`: the full scanner, reporter, organizer, approval prompt, deletion logic, and logger.
-- `cleanup_report.md`: generated Markdown report.
-- `cleanup_log.txt`: appended deletion log.
-
-## Safety Model
-
-The cleaner does not auto-delete anything. It refuses protected system/user roots, symlinks, source control metadata, and git repository roots.
-
-Protected roots include:
-
-- `~/Documents`
-- `~/Desktop`
-- `~/Pictures`
-- `~/Movies`
-- `~/Music`
-- `~/Applications`
-- `/System`
-- `/Library`
-- `/usr`
-- `/bin`
-- `/sbin`
-- `/Applications`
-
-The scanner still checks known developer locations such as `~/Desktop/Projects` for junk subfolders like `node_modules`, but it never suggests deleting the project directory itself.
-
-## Usage
-
-Run a scan and generate `cleanup_report.md` without deleting anything:
+## Quick Use
 
 ```bash
+# scan only
 python3 cleanup.py --dry-run
-```
 
-Run the interactive terminal cleanup flow:
-
-```bash
+# interactive cleanup
 python3 cleanup.py
-```
 
-The prompt accepts selections like:
-
-```text
-1 2 5
-all
-none
-```
-
-`all` only selects recommended `SAFE` items. Any deletion still requires typing exactly:
-
-```text
-DELETE
-```
-
-## Useful Options
-
-Scan a specific developer root:
-
-```bash
-python3 cleanup.py --dry-run --scan-root ~/Desktop/Projects
-```
-
-Lower the target threshold:
-
-```bash
-python3 cleanup.py --dry-run --min-target-mb 25
-```
-
-Change the report/log paths:
-
-```bash
-python3 cleanup.py --report cleanup_report.md --log cleanup_log.txt
-```
-
-Skip duplicate hashing for a faster scan:
-
-```bash
+# faster scan without duplicate hashing
 python3 cleanup.py --dry-run --no-duplicates
 ```
 
-Only hash very large files for duplicates:
+Useful flags:
 
 ```bash
-python3 cleanup.py --dry-run --duplicate-min-mb 500
+--scan-root ~/Desktop/Projects
+--min-target-mb 250
+--duplicate-min-mb 500
+--report cleanup_report.md
+--log cleanup_log.txt
 ```
 
-## Cleanup Categories
+## What It Looks For
 
-High-priority targets:
+- Caches: pip, Homebrew, Torch, HuggingFace, app caches
+- Developer junk: `node_modules`, `.venv`, `venv`, `__pycache__`, conda envs
+- AI storage: Ollama models, model/checkpoint files
+- Downloads: installers, archives, PDFs, videos, datasets, images
+- Media clutter: screenshots, videos, screen recordings
+- Hidden macOS storage: Application Support, Messages attachments, Xcode data
+- Large apps in `/Applications`
+- Git repo bloat
+- Exact duplicate files
 
-- HuggingFace cache
-- Torch cache
-- pip cache
-- Homebrew cache
-- Xcode DerivedData
-- Conda environments
-- `node_modules`
-- Python virtual environments
-- Ollama / local AI model caches
+## Safety Rules
 
-Medium-priority targets:
+- No automatic deletion.
+- Every selected deletion requires `DELETE`.
+- Source repos and `.git` folders are protected.
+- System paths are protected.
+- Manual-only targets are reported but not deleted by the tool.
 
-- Large files in `~/Downloads`
-- `.dmg`, `.pkg`, and `.zip` files in `~/Downloads`
-- Large videos found in scanned developer roots
-- Docker reclaimable storage, reported as manual-only
-- Screenshots older than 60 days
-- Exact duplicate files above the duplicate threshold
+Protected roots include `~/Documents`, `~/Desktop`, `~/Pictures`, `~/Movies`, `~/Music`, `~/Applications`, `/System`, `/Library`, `/usr`, `/bin`, `/sbin`, and `/Applications`.
 
-Low-priority targets:
+## Generated Files
 
-- `__pycache__` folders
-- User logs
-- App cache subfolders
-
-## Storage Intelligence
-
-The scanner now reports larger macOS storage buckets that normal folder cleanup misses:
-
-- Screenshots in `~/Desktop`, `~/Downloads`, and `~/Pictures/Screenshots`
-- Videos and screen recordings
-- Downloads breakdown by archives, installers, videos, images, PDFs, datasets, and documents
-- Installed app sizes from `/Applications`
-- Large `~/Library/Application Support` subfolders
-- `~/Library/Messages/Attachments`, as manual review only
-- Xcode developer storage
-- AI model files and model cache roots
-- Large git repositories, as manual review only
-- Exact duplicate groups ranked by reclaimable space
-
-Manual-only targets are shown to explain where storage is going, but the script will not delete them.
-
-## Organizer
-
-The terminal output and report include a recommended organizer summary for large files. It groups review items into buckets such as installers, archives, videos, and large files. This is advisory only; the tool does not move or rename files automatically.
+- `cleanup_report.md`: ranked suggestions, storage heatmap, duplicates, organizer notes
+- `cleanup_log.txt`: deletion history
