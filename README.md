@@ -85,6 +85,18 @@ Change the report/log paths:
 python3 cleanup.py --report cleanup_report.md --log cleanup_log.txt
 ```
 
+Skip duplicate hashing for a faster scan:
+
+```bash
+python3 cleanup.py --dry-run --no-duplicates
+```
+
+Only hash very large files for duplicates:
+
+```bash
+python3 cleanup.py --dry-run --duplicate-min-mb 500
+```
+
 ## Cleanup Categories
 
 High-priority targets:
@@ -97,6 +109,7 @@ High-priority targets:
 - Conda environments
 - `node_modules`
 - Python virtual environments
+- Ollama / local AI model caches
 
 Medium-priority targets:
 
@@ -104,12 +117,31 @@ Medium-priority targets:
 - `.dmg`, `.pkg`, and `.zip` files in `~/Downloads`
 - Large videos found in scanned developer roots
 - Docker reclaimable storage, reported as manual-only
+- Screenshots older than 60 days
+- Exact duplicate files above the duplicate threshold
 
 Low-priority targets:
 
 - `__pycache__` folders
 - User logs
 - App cache subfolders
+
+## Storage Intelligence
+
+The scanner now reports larger macOS storage buckets that normal folder cleanup misses:
+
+- Screenshots in `~/Desktop`, `~/Downloads`, and `~/Pictures/Screenshots`
+- Videos and screen recordings
+- Downloads breakdown by archives, installers, videos, images, PDFs, datasets, and documents
+- Installed app sizes from `/Applications`
+- Large `~/Library/Application Support` subfolders
+- `~/Library/Messages/Attachments`, as manual review only
+- Xcode developer storage
+- AI model files and model cache roots
+- Large git repositories, as manual review only
+- Exact duplicate groups ranked by reclaimable space
+
+Manual-only targets are shown to explain where storage is going, but the script will not delete them.
 
 ## Organizer
 
